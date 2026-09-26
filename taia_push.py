@@ -1,204 +1,110 @@
-#!/usr/bin/env python3
-"""
-TAIA LINE Push - GitHub Actions Version
-"""
 import os
 import sys
-import json
-import re
-import email
 import logging
-import imaplib
-from datetime import datetime, timedelta, timezone
-from email.header import decode_header
+import base64
+from datetime import datetime, timezone, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import smtplib
+from apscheduler.schedulers.blocking import BlockingScheduler
+import requests
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-try:
-    import requests
-    from bs4 import BeautifulSoup
-except ImportError:
-    print("ERROR: Missing dependencies")
-    sys.exit(1)
+GMAIL_USER = os.environ.get("GMAIL_USER")
+GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS")
+WORKER_URL = os.environ.get("WORKER_URL")
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "12"))
+RETRY_DELAY = int(os.environ.get("RETRY_DELAY", "300"))
+BKK_TZ = timezone(timedelta(hours=7))
 
-GMAIL_USER = os.environ.get("GMAIL_USER", "nilouis.r@gmail.com")
-GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS", "")
-WORKER_URL = os.environ.get("WORKER_URL", "https://line-push-bot.farmer-line-bot.workers.dev")
-EMAIL_SUBJECT_PREFIX = "[TAIA-REPORT]"
-THAI_TZ = timezone(timedelta(hours=7))
+def create_logger():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    return logging.getLogger("TAIA")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("taia_push")
-
-
-def get_today_str():
-    return datetime.now(THAI_TZ).strftime("%Y-%m-%d")
-
+def fetch_email_body(msg_id, service):
+    msg = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
+    for part in msg.get('payload', {}).get('parts', []):
+        if part.get('mimeType') == 'text/html':
+            data = part.get('body', {}).get('data', '')
+            return base64.urlsafe_b64decode(data).decode('utf-8')
+    body = msg.get('payload', {}).get('body', {}).get('data', '')
+    if body:
+        return base64.urlsafe_b64decode(body).decode('utf-8')
+    return ""
 
 def connect_gmail():
-    logger.info(f"Connecting to Gmail IMAP as {GMAIL_USER}...")
-    mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-    mail.login(GMAIL_USER, GMAIL_APP_PASS)
-    logger.info("Gmail login OK")
-    return mail
+    creds = Credentials(token=GMAIL_APP_PASS)
+    return build('gmail', 'v1', credentials=creds)
 
+def find_today_report(service):
+    tz = BKK_TZ
+    now = datetime.now(tz)
+    search_after = (now - timedelta(hours=26)).strftime('%Y/%m/%d')
+    search_before = (now + timedelta(hours=2)).strftime('%Y/%m/%d')
+    query = f'subject:"[TAIA-REPORT]" after:{search_after} before:{search_before}'
+    results = service.users().messages().list(userId='me', q=query, maxResults=5).execute()
+    messages = results.get('messages', [])
+    if messages:
+        return messages[0]['id']
+    return None
 
-def find_today_report(mail):
-    today = get_today_str()
-    search_subject = f'{EMAIL_SUBJECT_PREFIX} {today}'
-    logger.info(f'Searching for email: subject="{search_subject}"')
-    mail.select('INBOX', readonly=True)
-    date_str = datetime.now(THAI_TZ).strftime("%d-%b-%Y")
-    status, data = mail.search(None, f'(SUBJECT "{search_subject}" SINCE {date_str})')
-    if status != 'OK' or not data[0]:
-        status, data = mail.search(None, f'SUBJECT "{search_subject}"')
-    if status != 'OK' or not data[0]:
-        logger.info("No report email found")
-        return None, None
-    email_ids = data[0].split()
-    latest_id = email_ids[-1]
-    logger.info(f"Found report email (ID: {latest_id.decode()})")
-    status, msg_data = mail.fetch(latest_id, '(RFC822)')
-    if status != 'OK':
-        return None, None
-    raw_email = msg_data[0][1]
-    msg = email.message_from_bytes(raw_email)
-    body = ''
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype in ('text/plain', 'text/html'):
-                payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or 'utf-8'
-                    body = payload.decode(charset, errors='replace')
-                    if ctype == 'text/plain':
-                        break
-    else:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            charset = msg.get_content_charset() or 'utf-8'
-            body = payload.decode(charset, errors='replace')
-
-    url = None
-    for pattern in [r'(https://www\.coze\.cn/s/[^\s<>"\']+)',
-                    r'(https://www\.coze\.cn/[^\s<>"\']+)']:
-        match = re.search(pattern, body)
-        if match:
-            url = match.group(1).rstrip('.\'" \n\r')
-            break
-
-    summary = None
-    summary_match = re.search(r'\[TAIA-SUMMARY\]\s*\n(.*?)(?:\n\[TAIA-URL\]|\n---|\nhttp)',
-                              body, re.DOTALL)
-    if summary_match:
-        summary = summary_match.group(1).strip()
-
-    logger.info(f"URL found: {url is not None}")
-    logger.info(f"Summary found: {summary is not None}")
-    return url, summary
-
-
-def push_to_line(text):
-    if not text:
-        return False
-    try:
-        MAX_LEN = 4900
-        chunks = []
-        remaining = text
-        while remaining:
-            if len(remaining) <= MAX_LEN:
-                chunks.append(remaining)
-                break
-            idx = remaining.rfind('\n', 0, MAX_LEN)
-            if idx < MAX_LEN * 0.5:
-                idx = MAX_LEN
-            chunks.append(remaining[:idx])
-            remaining = remaining[idx:]
-        for i, chunk in enumerate(chunks):
-            resp = requests.post(
-                WORKER_URL,
-                headers={"Content-Type": "application/json"},
-                json={"message": chunk},
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                logger.info(f"LINE push chunk {i+1}/{len(chunks)} OK")
-            else:
-                logger.error(
-                    f"Worker chunk {i+1} returned {resp.status_code}: {resp.text}"
-                )
-                return False
-        return True
-    except Exception as e:
-        logger.error(f"Worker push failed: {e}")
-        return False
-
-
-def build_line_message(today, summary, url):
-    days_th = [
-        'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์', 'อาทิตย์'
-    ]
-    months_th = [
-        'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
-        'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'
-    ]
-    try:
-        dt = datetime.strptime(today, '%Y-%m-%d')
-        day_th = days_th[dt.weekday()]
-        month_th = months_th[dt.month - 1]
-        year_th = dt.year + 543
-        date_th = f"วัน{day_th}ที่ {dt.day} {month_th} {year_th}"
-    except Exception:
-        date_th = today
-
-    lines = []
-    lines.append("🌴 TAIA รายงานประจำวัน")
-    lines.append(f" {date_th}")
-    lines.append("")
-    if summary:
-        lines.append(summary)
-        lines.append("")
-    if url:
-        lines.append("📖 อ่านฉบับเต็ม:")
-        lines.append(url)
-        lines.append("")
-    lines.append("🤖 โดย TAIA v8.2 (via GitHub Actions)")
-    return '\n'.join(lines)
-
+def send_alert(msg_id, service):
+    now = datetime.now(BKK_TZ)
+    thai_date = now.strftime('%d %b %Y').replace('Jan','ม.ค.').replace('Feb','ก.พ.').replace('Mar','มี.ค.').replace('Apr','เม.ย.').replace('May','พ.ค.').replace('Jun','มิ.ย.').replace('Jul','ก.ค.').replace('Aug','ส.ค.').replace('Sep','ก.ย.').replace('Oct','ต.ค.').replace('Nov','พ.ย.').replace('Dec','ธ.ค.')
+    payload = {
+        "messages": [{
+            "type": "text",
+            "text": f"⚠️ TAIA Alert: ไม่พบรายงานวันที่ {now.strftime('%Y-%m-%d')} ({thai_date})\nเวลาตรวจสอบ: {now.strftime('%H:%M น.')}\nอีเมลอาจยังไม่ถึงหรือมีปัญหา กรุณาตรวจสอบ Gmail"
+        }]
+    }
+    headers = {"Content-Type": "application/json"}
+    r = requests.post(WORKER_URL, json=payload, headers=headers, timeout=10)
+    return r.status_code
 
 def main():
-    logger.info("=" * 60)
-    logger.info(" TAIA LINE Push (GitHub Actions)")
-    logger.info(f"📅 Date (TH): {get_today_str()}")
-    logger.info("=" * 60)
+    logger = create_logger()
+    logger.info("TAIA Push Started")
 
-    if not GMAIL_APP_PASS:
-        logger.error("GMAIL_APP_PASS not set!")
+    if not WORKER_URL:
+        logger.error("WORKER_URL not configured")
         sys.exit(1)
 
-    try:
-        mail = connect_gmail()
-    except Exception as e:
-        logger.error(f"Gmail connection failed: {e}")
-        push_to_line(f"⚠️ TAIA แจ้งเตือน: ไม่สามารถเชื่อมต่อ Gmail ได้\n{e}")
-        sys.exit(1)
-
-    url, summary = find_today_report(mail)
-    mail.logout()
-
-    if not url:
-        logger.info("No report URL found. Report may not be ready yet.")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            service = connect_gmail()
+            msg_id = find_today_report(service)
+            if msg_id:
+                logger.info(f"Found report: {msg_id}")
+                break
+        except Exception as e:
+            logger.warning(f"Attempt {attempt}/{MAX_RETRIES} failed: {e}")
+        if attempt < MAX_RETRIES:
+            logger.info(f"Retry in {RETRY_DELAY}s...")
+            import time
+            time.sleep(RETRY_DELAY)
+    else:
+        logger.error("Report not found after all retries")
+        send_alert(msg_id, service)
+        logger.info("Alert sent to LINE")
         sys.exit(0)
 
-    today = get_today_str()
-    message = build_line_message(today, summary, url)
-    ok = push_to_line(message)
-
-    if ok:
-        logger.info("✅ TAIA daily report pushed to LINE successfully")
-    else:
-        logger.error(" Failed to push to LINE")
+    try:
+        html = fetch_email_body(msg_id, service)
+        payload = {"messages": [{"type": "text", "text": html, "format": "html"}]}
+        headers = {"Content-Type": "application/json"}
+        r = requests.post(WORKER_URL, json=payload, headers=headers, timeout=10)
+        logger.info(f"Sent to LINE: {r.status_code}")
+    except Exception as e:
+        logger.error(f"Send failed: {e}")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
